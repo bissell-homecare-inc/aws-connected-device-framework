@@ -13,34 +13,67 @@
 import { AssetLibUpdate } from './assetlib_update';
 import { logger } from './utils/logger';
 import { container } from './di/inversify.config';
-import {TYPES} from './di/types';
+import { TYPES } from './di/types';
+import _ from 'lodash';
+import { LifecycleEvent } from './lifecycleEvent.model';
+import async from 'async';
 
-let assetLib:AssetLibUpdate;
+let assetLib: AssetLibUpdate;
+
+async function handleMessage(message: LifecycleEvent) {
+  const clientId = message.clientId;
+
+  let connected: boolean = message.eventType === 'connected';
+  // DUPLICATE_CLIENTID means the device will be reconnecting shortly, so
+  // don't worry about trying to update in this scenario
+  if (message.disconnectReason === 'DUPLICATE_CLIENTID') {
+    return;
+  }
+  const currentlyConnected = await assetLib.getDeviceConnected(clientId);
+  if (currentlyConnected !== undefined && connected !== currentlyConnected) {
+    await assetLib.updateDeviceConnected(clientId, connected);
+  }
+}
+
+/***
+ * Take an array of lifecycle events and remove all but the
+ * latest event for each clientId from the array
+ */
+function filterEventList(events: LifecycleEvent[]): LifecycleEvent[] {
+  const groupedRecords: { [clientId: string]: LifecycleEvent[] } = _.groupBy(
+    events,
+    (record: LifecycleEvent) => record.clientId
+  );
+  const filteredEvents: LifecycleEvent[] = [];
+  for (const message in groupedRecords) {
+    // Get the latest lifecycle event
+    const lifecycleEvent: LifecycleEvent = _.sortBy(groupedRecords[message], (e) => e.timestamp)[
+      groupedRecords[message].length - 1
+    ];
+
+    filteredEvents.push(lifecycleEvent);
+  }
+  return filteredEvents;
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 exports.lambda_handler = async (event: any, _context: unknown) => {
   logger.debug(`event: ${JSON.stringify(event)}`);
 
-  if (assetLib===undefined) {
+  if (assetLib === undefined) {
     assetLib = container.get(TYPES.AssetLibUpdate);
   }
 
-  const clientId = event.clientId;
-
-  // TODO: figure out how to extract a boolean `connected` from the eventType
-  const status = event.eventType;
-  let connected:boolean;
-  if (status === 'connected') {
-    connected = true;
-  } else if (status === 'disconnected') {
-    if (event.disconnectReason === 'DUPLICATE_CLIENTID') {
-      return;
-    } else {
-      connected = false;
-    }
+  if ('Records' in event) {
+    const records = filterEventList(event.Records);
+    await async.forEachLimit(records, 5, async (record) => {
+      await handleMessage(record);
+    });
   } else {
-    connected = false;
+    try {
+      await handleMessage(event);
+    } catch (e) {
+      logger.debug(`Invalid event: ${JSON.stringify(event)}`);
+    }
   }
-
-  await assetLib.updateDeviceConnected(clientId, connected);
 };
